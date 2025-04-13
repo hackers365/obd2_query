@@ -2,6 +2,8 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <Adafruit_NeoPixel.h>
+#include "esp_task_wdt.h"
+#include "driver/twai.h" // 直接包含ESP32 TWAI驱动
 
 // Simple sketch that querries OBD2 over CAN for coolant temperature
 // Showcasing simple use of ESP32-TWAI-CAN library driver.
@@ -29,6 +31,19 @@ const char* ELM_INIT = "ATZ\r\rELM327 v1.5\r\r>";
 const char* ELM_OK = "OK\r\r>";
 const char* ELM_ERROR = "?\r\r>";
 
+// 添加CAN总线错误恢复相关变量
+unsigned long lastErrorCheckTime = 0;
+const unsigned long ERROR_CHECK_INTERVAL = 2000; // 每2秒检查一次
+unsigned int consecutiveErrors = 0;
+const unsigned int MAX_ERRORS_BEFORE_RESET = 3;  // 3次连续错误后重置总线
+
+// 添加OBD协议配置
+bool useExtendedFrames = true;  // 默认使用29位扩展帧
+#define OBD_STD_REQUEST_ID     0x7DF   // 11位标准帧请求ID
+#define OBD_STD_RESPONSE_ID    0x7E8   // 11位标准帧响应ID
+#define OBD_EXT_REQUEST_ID     0x18DB33F1  // 29位扩展帧请求ID
+#define OBD_EXT_RESPONSE_BASE  0x18DAF100  // 29位扩展帧响应基址
+
 // 定义支持的PID
 #define PID_ENGINE_RPM      0x0C
 #define PID_VEHICLE_SPEED   0x0D
@@ -45,7 +60,7 @@ const char* ELM_ERROR = "?\r\r>";
 // DBC相关定义
 #define CAN_ID_ENGINE_DATA1    0x158    // 示例：发动机数据1
 #define CAN_ID_ENGINE_DATA2    0x17C    // 示例：发动机数据2
-#define CAN_ID_OBD_RESPONSE    0x7E8    // OBD-II标准响应
+#define CAN_ID_OBD_RESPONSE    0x18DAF133    // OBD-II 29位扩展帧响应ID
 #define CAN_ID_DOORS_STATUS    0x405    // DOORS_STATUS报文ID
 #define CAN_ID_GEARBOX         0x1A3    // GEARBOX报文ID
 #define CAN_ID_SCM_FEEDBACK     0x326    // SCM_FEEDBACK报文ID
@@ -72,6 +87,8 @@ enum GEAR_VALUES {
 // 添加新的函数声明
 void parseOBDResponse(const CanFrame& frame);
 void parseVehicleData(const CanFrame& frame);
+bool isOBDResponse(uint32_t canId);  // 新增：检查是否为OBD响应ID
+void sendOBDRequest(uint8_t mode, uint8_t pid, bool useExtended);  // 新增：发送OBD请求
 
 // 添加发送频率控制
 #define MIN_SEND_INTERVAL    50  // 最小发送间隔(ms)
@@ -120,6 +137,105 @@ bool canSendData(uint32_t canId) {
     return true;
 }
 
+// 检查是否为OBD响应ID
+bool isOBDResponse(uint32_t canId) {
+    if (useExtendedFrames) {
+        // 29位扩展帧：检查响应ID范围 (0x18DAF100 to 0x18DAF1FF)
+        return ((canId & 0xFFFFFF00) == OBD_EXT_RESPONSE_BASE);
+    } else {
+        // 11位标准帧：检查响应ID是否为0x7E8
+        return (canId == OBD_STD_RESPONSE_ID);
+    }
+}
+
+// 新增：重置CAN总线函数
+void resetCANBus() {
+    Serial.println("正在重置CAN总线...");
+    
+    // 停止CAN总线
+    ESP32Can.end();
+    delay(200);  // 稍微延长等待时间
+    
+    // 重新初始化CAN总线
+    if (!ESP32Can.begin(TWAI_SPEED_500KBPS)) {
+        Serial.println("CAN总线重新初始化失败!");
+        setLED(false);  // LED指示错误
+        delay(1000);
+        esp_restart();  // 如果重新初始化失败，重启设备
+    }
+    
+    Serial.println("CAN总线已重置");
+    consecutiveErrors = 0;  // 重置错误计数
+}
+
+// 修改：简化的CAN总线状态检查
+void checkCANBusStatus() {
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastErrorCheckTime >= ERROR_CHECK_INTERVAL) {
+        lastErrorCheckTime = currentTime;
+        
+        // 使用直接的TWAI驱动API获取状态
+        twai_status_info_t status;
+        if (twai_get_status_info(&status) == ESP_OK) {
+            // 如果处于总线错误状态，重置总线
+            if (status.state == TWAI_STATE_BUS_OFF || 
+                status.state == TWAI_STATE_RECOVERING) {
+                Serial.printf("CAN总线状态异常: %d, 需要重置\n", status.state);
+                resetCANBus();
+            }
+            
+            // 打印状态信息用于调试
+            Serial.printf("CAN状态: 状态=%d, 发送错误=%d, 接收错误=%d, Tx排队=%d, Rx排队=%d\n",
+                         status.state, status.tx_error_counter, status.rx_error_counter,
+                         status.msgs_to_tx, status.msgs_to_rx);
+        }
+    }
+}
+
+// 发送OBD请求函数
+void sendOBDRequest(uint8_t mode, uint8_t pid, bool useExtended) {
+    CanFrame requestFrame;
+    
+    if (useExtended) {
+        // 使用29位扩展帧
+        requestFrame.identifier = OBD_EXT_REQUEST_ID;
+        requestFrame.extd = 1;
+    } else {
+        // 使用11位标准帧
+        requestFrame.identifier = OBD_STD_REQUEST_ID;
+        requestFrame.extd = 0;
+    }
+    
+    requestFrame.data_length_code = 8;
+    
+    // 设置请求数据
+    requestFrame.data[0] = 0x02;  // 数据长度
+    requestFrame.data[1] = mode;  // 模式
+    requestFrame.data[2] = pid;   // PID
+    
+    // 填充剩余字节为0
+    for(int i = 3; i < 8; i++) {
+        requestFrame.data[i] = 0x00;
+    }
+    
+    // 使用非阻塞发送
+    if (ESP32Can.writeFrame(requestFrame)) {
+        Serial.printf("已发送OBD请求 - ID: 0x%X, 模式: %02X, PID: %02X, %s\n", 
+                    requestFrame.identifier, mode, pid, 
+                    useExtended ? "29位扩展帧" : "11位标准帧");
+        consecutiveErrors = 0;  // 成功发送，重置错误计数
+    } else {
+        Serial.println("OBD请求发送失败");
+        consecutiveErrors++;
+        
+        // 如果连续失败次数超过阈值，重置CAN总线
+        if (consecutiveErrors >= MAX_ERRORS_BEFORE_RESET) {
+            resetCANBus();
+        }
+    }
+}
+
 // ESP-NOW接收回调
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int data_len) {
     // 检查数据长度
@@ -134,15 +250,24 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int data_l
 
     // 解析OBD请求
     CanFrame frame;
-    frame.identifier = 0x7DF;        // OBD-II请求标准ID
-    frame.data_length_code = 8;      // 标准长度
-    frame.extd = 0;                  // 标准帧
     
     // 检查是否是AT命令
     if (data[0] == 'A' && data[1] == 'T') {
         // 处理AT命令
         if (strncmp((char*)data, "ATZ", 3) == 0) {
             sendElm327Response(ELM_INIT, 0);
+        } else if (strncmp((char*)data, "ATSP", 4) == 0) {
+            // 检查是否设置协议为CAN (11/500 或 29/500)
+            if (data_len >= 5) {
+                if (data[4] == '6') { // ATSP6 - ISO 15765-4, CAN (11/500)
+                    useExtendedFrames = false;
+                    Serial.println("设置为11位标准帧模式");
+                } else if (data[4] == '7') { // ATSP7 - ISO 15765-4, CAN (29/500)
+                    useExtendedFrames = true;
+                    Serial.println("设置为29位扩展帧模式");
+                }
+            }
+            sendElm327Response(ELM_OK, 0);
         } else {
             sendElm327Response(ELM_OK, 0);
         }
@@ -171,22 +296,9 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int data_l
     if (data_len >= 4 && isxdigit(data[2]) && isxdigit(data[3])) {
         pid = (hex2int(data[2]) << 4) | hex2int(data[3]);
     }
-
-    // 构建CAN消息
-    frame.data[0] = 0x02;        // 数据长度
-    frame.data[1] = mode;        // 模式
-    frame.data[2] = pid;         // PID
     
-    // 填充剩余字节为0
-    for(int i = 3; i < 8; i++) {
-        frame.data[i] = 0x00;
-    }
-    
-    Serial.printf("发送CAN请求 - ID: 0x%03X, Mode: %02X, PID: %02X\n", 
-                 frame.identifier, mode, pid);
-    
-    // 发送CAN消息
-    ESP32Can.writeFrame(frame);
+    // 发送OBD请求（使用当前帧类型设置）
+    sendOBDRequest(mode, pid, useExtendedFrames);
 }
 
 // ESP-NOW发送回调
@@ -198,8 +310,14 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 // 修改sendElm327Response函数，移除重复的频率检查
 void sendElm327Response(const char* response, uint32_t canId) {
+    size_t len = strlen(response);
+    if (len > 31) {  // 确保不超过缓冲区大小
+        Serial.println("响应数据过长");
+        return;
+    }
+    
     // 发送数据
-    if (esp_now_send(broadcastAddress, (uint8_t*)response, strlen(response)) == ESP_OK) {
+    if (esp_now_send(broadcastAddress, (uint8_t*)response, len) == ESP_OK) {
         Serial.printf("ESP-NOW发送[0x%03X]: %s\n", canId, response);
     } else {
         Serial.println("ESP-NOW发送失败");
@@ -208,17 +326,44 @@ void sendElm327Response(const char* response, uint32_t canId) {
 
 // OBD响应解析函数
 void parseOBDResponse(const CanFrame& frame) {
-    if (frame.data[0] < 2) return;
-    
-    char response[100] = {0};
-    char temp[8];
-    
-    for(int i = 1; i <= frame.data[0]; i++) {
-        sprintf(temp, "%02X ", frame.data[i]);
-        strcat(response, temp);
+    // 验证数据长度
+    if (frame.data[0] < 2 || frame.data[0] > 7) {
+        Serial.println("无效的OBD响应长度");
+        return;
     }
     
+    // 32字节足够存储最长的响应
+    char response[32] = {0};
+    char temp[8];
+    
+    // 添加模式字节验证
+    if (frame.data[1] != 0x41 && frame.data[1] != 0x42) {
+        Serial.printf("未支持的OBD响应模式: %02X\n", frame.data[1]);
+        sendElm327Response(ELM_ERROR, frame.identifier);
+        return;
+    }
+    
+    // 检查剩余缓冲区大小
+    size_t remaining = sizeof(response);
+    char* ptr = response;
+    
+    for(int i = 1; i <= frame.data[0]; i++) {
+        int written = snprintf(ptr, remaining, "%02X ", frame.data[i]);
+        if (written < 0 || written >= remaining) {
+            Serial.println("响应缓冲区溢出");
+            return;
+        }
+        ptr += written;
+        remaining -= written;
+    }
+    
+    // 确保有足够空间添加结尾
+    if (remaining < 4) {  // "\r\r>" + null terminator
+        Serial.println("响应缓冲区不足");
+        return;
+    }
     strcat(response, "\r\r>");
+    
     Serial.printf("解析OBD响应: %s\n", response);
     sendElm327Response(response, frame.identifier);
 }
@@ -232,7 +377,7 @@ void parseVehicleData(const CanFrame& frame) {
     }
 
     bool dataUpdated = false;
-    char response[100] = {0};
+    char response[32] = {0};  // 32字节的缓冲区
     
     switch(frame.identifier) {
         case CAN_ID_ENGINE_DATA1: {
@@ -247,14 +392,23 @@ void parseVehicleData(const CanFrame& frame) {
                          vehicleData.speed_kph, vehicleData.rpm);
 
             // 发送车速PID响应
-            sprintf(response, "41 0D %02X\r\r>", (uint8_t)vehicleData.speed_kph);
+            int len = snprintf(response, sizeof(response), "41 0D %02X\r\r>", 
+                             (uint8_t)vehicleData.speed_kph);
+            if (len < 0 || len >= sizeof(response)) {
+                Serial.println("车速响应缓冲区溢出");
+                return;
+            }
             sendElm327Response(response, frame.identifier);
             
             // 发送转速PID响应
-            uint16_t rpm_value = vehicleData.rpm * 4;  // OBD-II RPM = 实际RPM * 4
-            sprintf(response, "41 0C %02X %02X\r\r>",
-                    (rpm_value >> 8) & 0xFF,
-                    rpm_value & 0xFF);
+            uint16_t rpm_value = vehicleData.rpm * 4;
+            len = snprintf(response, sizeof(response), "41 0C %02X %02X\r\r>",
+                         (rpm_value >> 8) & 0xFF,
+                         rpm_value & 0xFF);
+            if (len < 0 || len >= sizeof(response)) {
+                Serial.println("转速响应缓冲区溢出");
+                return;
+            }
             sendElm327Response(response, frame.identifier);
             
             dataUpdated = true;
@@ -411,9 +565,12 @@ void parseVehicleData(const CanFrame& frame) {
             
             // 构造自定义PID响应 (PID: 0xD4)
             // 返回两个字节：ECON状态 + 驾驶模式
-            sprintf(response, "41 D4 %02X %02X\r\r>", 
-                    econ_status,    // 第一个字节: ECON (0:关闭 1:开启)
-                    mode_status);   // 第二个字节: 驾驶模式 (0-3)
+            int len = snprintf(response, sizeof(response), "41 D4 %02X %02X\r\r>", 
+                             econ_status, mode_status);
+            if (len < 0 || len >= sizeof(response)) {
+                Serial.println("驾驶模式响应缓冲区溢出");
+                return;
+            }
             sendElm327Response(response, frame.identifier);
             
             dataUpdated = true;
@@ -448,6 +605,33 @@ void setLED(bool state) {
     ws2812.show();
 }
 
+// 修改看门狗配置
+#define WDT_TIMEOUT_SECONDS 5  // 5秒超时
+
+// 在适当的位置添加内存检查函数
+void checkHeapMemory() {
+    static uint32_t lastCheck = 0;
+    const uint32_t CHECK_INTERVAL = 10000;  // 每10秒检查一次
+    
+    if (millis() - lastCheck >= CHECK_INTERVAL) {
+        Serial.printf("可用堆内存: %d bytes\n", ESP.getFreeHeap());
+        lastCheck = millis();
+    }
+}
+
+// 添加定时查询车速的函数
+void queryVehicleSpeed() {
+    static unsigned long lastQueryTime = 0;
+    const unsigned long QUERY_INTERVAL = 1000;  // 1秒间隔
+    
+    unsigned long currentTime = millis();
+    if (currentTime - lastQueryTime >= QUERY_INTERVAL) {
+        // 发送OBD请求，使用当前帧类型设置
+        sendOBDRequest(0x01, 0x05, useExtendedFrames);
+        lastQueryTime = currentTime;
+    }
+}
+
 void setup() {
     // 初始化WS2812
     ws2812.begin();
@@ -463,7 +647,13 @@ void setup() {
     
     // 初始化CAN总线 - 使用ESP32Can而不是自己创建对象
     ESP32Can.setPins(CAN_TX, CAN_RX);
-    ESP32Can.begin(TWAI_SPEED_500KBPS);
+    if (!ESP32Can.begin(TWAI_SPEED_500KBPS)) {
+        Serial.println("CAN总线初始化失败!");
+        setLED(false);  // LED指示错误
+        while(1) {
+            delay(1000);
+        }
+    }
 
     // 初始化WiFi为站点模式
     WiFi.mode(WIFI_STA);
@@ -471,7 +661,10 @@ void setup() {
     // 初始化ESP-NOW
     if (esp_now_init() != ESP_OK) {
         Serial.println("ESP-NOW初始化错误");
-        return;
+        setLED(false);  // LED指示错误
+        while(1) {
+            delay(1000);
+        }
     }
 
     // 注册ESP-NOW回调
@@ -486,19 +679,39 @@ void setup() {
     esp_now_add_peer(&peerInfo);
     
     Serial.println("初始化完成，等待命令...");
+
+    // 初始化看门狗
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // 监控所有核心
+        .trigger_panic = true  // 启用panic处理
+    };
+    esp_task_wdt_init(&wdt_config);
+    esp_task_wdt_add(NULL);  // 将当前任务添加到看门狗
 }
 
 void loop() {
+    checkHeapMemory();
+    // 喂狗
+    esp_task_wdt_reset();
+    
+    // 检查CAN总线状态
+    checkCANBusStatus();
+    
+    // 定期查询车速
+    //queryVehicleSpeed();
+    
     // 使用ESP32Can接收消息
     if (ESP32Can.readFrame(rxFrame)) {
-        Serial.printf("收到CAN帧 - ID: 0x%03X, DLC: %d\n", 
-                     rxFrame.identifier, 
-                     rxFrame.data_length_code);
-                     
         // 收到数据时点亮LED
         setLED(true);
-                     
-        if (rxFrame.identifier == CAN_ID_OBD_RESPONSE) {
+        
+        // 检查是否为OBD响应
+        if (isOBDResponse(rxFrame.identifier)) {
+            Serial.printf("收到CAN帧 - ID: 0x%08X, DLC: %d, 扩展帧: %d\n", 
+                rxFrame.identifier, 
+                rxFrame.data_length_code,
+                rxFrame.extd);
             parseOBDResponse(rxFrame);
         } else {
             parseVehicleData(rxFrame);
